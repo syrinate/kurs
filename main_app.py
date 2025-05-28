@@ -4,11 +4,29 @@ import os
 import threading
 import subprocess
 import sys
+from unittest.mock import MagicMock
 
+import cv2
+import pickle
+from keras_facenet import FaceNet
+
+from module_recognize import FaceRecognizer
+from module_capture_faces import capture_faces
+from module_train_face import train_face_recognition
 
 class FaceRecognitionApp:
-    def __init__(self, root):
-        self.root = root
+    def __init__(self, root=None, headless=False):
+        self.root = root or tk.Tk()
+        self.headless = headless
+
+        if not self.headless:
+            self.setup_ui()
+        else:
+            self.status_var = MagicMock()
+            self.add_face_btn = MagicMock()
+            self.capture_btn = MagicMock()
+            self.process_train_btn = MagicMock()
+            self.recognition_btn = MagicMock()
         self.root.title("Face Recognition System")
         self.root.geometry("800x500")
         self.root.minsize(800, 500)
@@ -21,9 +39,6 @@ class FaceRecognitionApp:
         self.new_person_name = ""
         self.new_faces_count = 0
         self.recognition_active = False
-
-        # Initialize UI
-        self.setup_ui()
 
         # Disable buttons at startup
         self.toggle_buttons_state(False)
@@ -69,12 +84,6 @@ class FaceRecognitionApp:
             command=self.toggle_recognition, **button_options)
         self.recognition_btn.pack(fill=tk.X, pady=5)
 
-        # Add current face button
-        self.add_face_btn = ttk.Button(
-            control_frame, text="Добавить текущее лицо",
-            command=self.add_current_face, state=tk.DISABLED, **button_options)
-        self.add_face_btn.pack(fill=tk.X, pady=5)
-
         # Video display canvas
         self.canvas = tk.Canvas(self.display_frame, bg='black')
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -99,28 +108,27 @@ class FaceRecognitionApp:
         self.start_new_person_capture()
 
     def process_and_train(self):
-        """Combined processing and training function"""
         if not os.path.exists("my_faces"):
             self.show_error("Сначала захватите лица!")
             return
 
-        try:
-            self.toggle_buttons_state(False)
-            self.status_var.set("Обработка и обучение...")
+        self.toggle_buttons_state(False)
+        self.status_var.set("Обработка и обучение...")
 
-            def completion_callback():
-                self.status_var.set("Обработка и обучение завершены!")
-                self.load_models_async()
-                self.toggle_buttons_state(True)
+        def run_training():
+            code = train_face_recognition()
+            self.root.after(0, lambda: self.training_finished(code))
 
-            threading.Thread(
-                target=self.run_subprocess_with_callback,
-                args=([sys.executable, "module_train_face.py"], completion_callback),
-                daemon=True
-            ).start()
+        threading.Thread(target=run_training, daemon=True).start()
 
-        except Exception as e:
-            self.show_error(f"Ошибка: {str(e)}")
+    def training_finished(self, code):
+        if code == 0:
+            self.status_var.set("Обучение завершено!")
+            self.models_loaded = True
+            self.recognizer = FaceRecognizer()
+        else:
+            self.show_error("Ошибка при обучении.")
+        self.toggle_buttons_state(True)
 
     def toggle_recognition(self):
         """Toggle recognition mode"""
@@ -158,7 +166,6 @@ class FaceRecognitionApp:
         self.capture_btn.config(state=state)
         self.process_train_btn.config(state=state)
         self.recognition_btn.config(state=state)
-        self.add_face_btn.config(state=tk.DISABLED if not self.new_person_mode else state)
 
     def run_subprocess_with_callback(self, command, callback):
         """Run subprocess and call callback when finished"""
@@ -174,21 +181,35 @@ class FaceRecognitionApp:
             self.root.after(0, lambda: self.show_error(f"Ошибка выполнения: {str(e)}"))
 
     def load_models(self):
-        """Прямой вызов загрузки моделей (для тестов и синхронного запуска)"""
         try:
-            if not os.path.exists("svm_model.pkl") or not os.path.exists("le.pkl"):
-                self.status_var.set("Модели не найдены")
+            print("DEBUG: Загрузка моделей начата")
+
+            if not os.path.exists("svm_model.pkl") or not os.path.exists("label_encoder.pkl"):
+                print("DEBUG: Модели не найдены")
+                self.status_var.set("Models not found")
                 return
+
             with open("svm_model.pkl", "rb") as f:
                 self.model = pickle.load(f)
-            with open("le.pkl", "rb") as f:
+
+            with open("label_encoder.pkl", "rb") as f:
                 self.le = pickle.load(f)
-            self.embedder = FaceNet()
+
+            print("DEBUG: pickle.load прошёл")
+
+            self.embedder = FaceNet(model_path="models/20180402-114759")
             self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+            print("DEBUG: FaceNet и CascadeClassifier инициализированы")
+
             self.models_loaded = True
-            self.status_var.set("Модели загружены")
+            self.status_var.set("Models loaded")
+
+            print("DEBUG: models_loaded = True")
+
         except Exception as e:
-            self.status_var.set(f"Ошибка загрузки моделей: {str(e)}")
+            print(f"ERROR in load_models: {str(e)}")
+            self.status_var.set(f"Model loading error: {str(e)}")
 
     def load_models_async(self):
         """Load models in background thread"""
@@ -204,6 +225,7 @@ class FaceRecognitionApp:
                     self.detector = cv2.CascadeClassifier(
                         cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
                     self.models_loaded = True
+                    self.recognizer = FaceRecognizer()
                     self.root.after(0, lambda: self.status_var.set("Модели загружены"))
                 else:
                     self.root.after(0, lambda: self.status_var.set("Модели не найдены"))
@@ -228,17 +250,20 @@ class FaceRecognitionApp:
         self.toggle_buttons_state(True)
 
     def start_new_person_capture(self):
-        """Start capturing new person"""
-        self.new_person_name = simpledialog.askstring(
-            "Новый человек", "Введите имя человека:", parent=self.root)
-
+        self.new_person_name = simpledialog.askstring("Новый человек", "Введите имя человека:", parent=self.root)
         if self.new_person_name:
-            os.makedirs(f"my_faces/{self.new_person_name}", exist_ok=True)
             self.new_person_mode = True
-            self.new_faces_count = 0
-            self.status_var.set(f"Захват лиц для {self.new_person_name} - добавляйте лица")
-            self.start_camera()
-            self.add_face_btn.config(state=tk.NORMAL)
+            self.status_var.set(f"Захват лиц для {self.new_person_name} — подождите...")
+            self.toggle_buttons_state(False)
+            self.add_face_btn.config(state="normal")
+            def run_capture():
+                capture_faces(self.new_person_name)
+                self.root.after(0, lambda: [
+                    self.status_var.set(f"Захват завершён для {self.new_person_name}"),
+                    self.toggle_buttons_state(True)
+                ])
+
+            threading.Thread(target=run_capture, daemon=True).start()
 
     def start_camera(self):
         """Start camera capture"""
@@ -268,31 +293,7 @@ class FaceRecognitionApp:
             self.root.after(10, self.update_frame)
 
     def process_frame(self, frame):
-        """Process frame for face recognition"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.detector.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
-
-        for (x, y, w, h) in faces:
-            face_img = frame[y:y + h, x:x + w]
-            face = cv2.resize(face_img, (160, 160))
-
-            try:
-                embedding = self.embedder.embeddings(np.expand_dims(face, axis=0))[0]
-                proba = self.model.predict_proba([embedding])[0]
-                max_prob = np.max(proba)
-                pred_class = np.argmax(proba)
-                name = self.le.inverse_transform([pred_class])[0]
-
-                color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
-
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(frame, f"{name} {max_prob:.2f}",
-                           (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-            except Exception as e:
-                print(f"Ошибка: {e}")
-
-        return frame
+        return self.recognizer.recognize(frame)
 
     def display_image(self, frame):
         """Display image in GUI"""
@@ -303,23 +304,16 @@ class FaceRecognitionApp:
         self.canvas.create_image(0, 0, anchor=tk.NW, image=img)
         self.canvas.image = img
 
-    def add_current_face(self):
-        """Add current face to dataset"""
-        if self.current_face is None or not self.new_person_mode:
-            return
-
-        try:
-            cv2.imwrite(f"my_faces/{self.new_person_name}/face_{self.new_faces_count}.jpg",
-                       self.current_face)
-            self.new_faces_count += 1
-            self.status_var.set(
-                f"Добавлено {self.new_faces_count} лиц. Продолжайте или перейдите к обработке")
-        except Exception as e:
-            self.show_error(f"Ошибка сохранения: {str(e)}")
-
     def on_closing(self):
-        """Handle window closing"""
-        self.stop_recognition()
+        """Properly stop camera and close the app"""
+        self.is_camera_active = False
+        self.recognition_active = False
+
+        if hasattr(self, 'cap') and self.cap and self.cap.isOpened():
+            self.cap.release()
+
+        cv2.destroyAllWindows()
+        self.root.quit()
         self.root.destroy()
 
 
